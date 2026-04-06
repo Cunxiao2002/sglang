@@ -45,6 +45,7 @@ on:
           - nightly-8-gpu-qwen35-rocm720
           - nightly-8-gpu-glm5-rocm720
           - nightly-8-gpu-minimax-m25-rocm720
+          - nightly-accuracy-2-gpu-gemma4-rocm720
           - nightly-1-gpu-zimage-turbo-rocm720
           - nightly-test-1-gpu-mi35x-rocm720
           - nightly-accuracy-8-gpu-mi35x-rocm720
@@ -63,6 +64,7 @@ on:
           - nightly-8-gpu-mi35x-glm5-rocm720
           - nightly-8-gpu-mi35x-glm47-fp8-rocm720
           - nightly-8-gpu-mi35x-minimax-m25-rocm720
+          - nightly-8-gpu-mi35x-gemma4-rocm720
       job_filter:
         description: 'Or type comma-separated job names (overrides dropdown if non-empty)'
         required: false
@@ -752,6 +754,36 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+  # 2-GPU Gemma 4 (Accuracy) ROCm 7.2
+  nightly-accuracy-2-gpu-gemma4-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-2-gpu-gemma4-rocm720,'))
+    runs-on: linux-mi325-2gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+
+      - name: Accuracy Test ROCm 7.2 (2-GPU Gemma 4)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-2-gpu-gemma4 --nightly --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
   # ============================================== MI30x ROCm 7.2 Diffusion Tests ==============================================
   # 1-GPU Z-Image-Turbo (Diffusion T2I) ROCm 7.2
   nightly-1-gpu-zimage-turbo-rocm720:
@@ -1411,6 +1443,38 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+  # MI35x 8-GPU Gemma 4 (Accuracy) ROCm 7.2
+  nightly-8-gpu-mi35x-gemma4-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-gemma4-rocm720,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU Gemma 4)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-gemma4 --nightly --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
   # MI35x 8-GPU DeepSeek-V3.2 Performance Test (MTP) ROCm 7.2
   nightly-perf-8-gpu-mi35x-deepseek-v32-mtp-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-8-gpu-mi35x-deepseek-v32-mtp-rocm720,'))
@@ -1470,6 +1534,7 @@ jobs:
       - nightly-8-gpu-qwen35-rocm720
       - nightly-8-gpu-glm5-rocm720
       - nightly-8-gpu-minimax-m25-rocm720
+      - nightly-accuracy-2-gpu-gemma4-rocm720
       # MI30x ROCm 7.2 Diffusion Tests
       - nightly-1-gpu-zimage-turbo-rocm720
       # MI35x ROCm 7.2 jobs
@@ -1490,6 +1555,7 @@ jobs:
       - nightly-8-gpu-mi35x-glm5-rocm720
       - nightly-8-gpu-mi35x-glm47-fp8-rocm720
       - nightly-8-gpu-mi35x-minimax-m25-rocm720
+      - nightly-8-gpu-mi35x-gemma4-rocm720
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed
