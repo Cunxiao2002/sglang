@@ -48,7 +48,7 @@ Native DP-attention benchmark inside one TP world:
     --num-layers 1 \
     --layer-start 0
 
-# DeepSeek V32
+# DeepSeek V32 nsys profile
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SGLANG_DEEPEP_SYNC_FINISH=1 \
 nsys profile \
     --trace-fork-before-exec=true \
@@ -61,7 +61,6 @@ nsys profile \
       --model-path deepseek-ai/DeepSeek-V3.2-Exp \
       --trust-remote-code \
       --tp 8 \
-      --ep 8 \
       --all2all-backend deepep_high_throughput \
       --moe-runner-backend deep_gemm \
       --fp8-gemm-backend deep_gemm \
@@ -75,6 +74,29 @@ nsys profile \
       --enable-layerwise-nvtx-marker
 
 # MiniMax-M2.5
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SGLANG_DEEPEP_SYNC_FINISH=1 \
+nsys profile \
+    --trace-fork-before-exec=true \
+    --trace=cuda,nvtx,osrt \
+    --capture-range=cudaProfilerApi \
+    --capture-range-end=stop \
+    -f true \
+    -o sglang_minimax_tp8_b64_s1024_deepgemm_deepep_nvtx \
+    python3 benchmark/bench_single_layer.py \
+      --model-path MiniMaxAI/MiniMax-M2.5 \
+      --trust-remote-code \
+      --tp 8 \
+      --all2all-backend deepep_high_throughput \
+      --moe-runner-backend deep_gemm \
+      --fp8-gemm-backend deep_gemm \
+      --batch-size 64 \
+      --seq-len 1024 \
+      --output-len 1 \
+      --num-layers 1 \
+      --layer-start 4 \
+      --load-format dummy \
+      --profile \
+      --enable-layerwise-nvtx-marker
 
 
 Important launcher note:
