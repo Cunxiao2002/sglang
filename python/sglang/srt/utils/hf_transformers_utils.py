@@ -60,6 +60,11 @@ from transformers import (
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
+from transformers.dynamic_module_utils import (
+    get_class_from_dynamic_module,
+    resolve_trust_remote_code,
+)
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs import (
@@ -133,6 +138,250 @@ _CONFIG_REGISTRY = {
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
+
+
+def _resolve_config_pretrained_source(
+    model: Union[str, Path], kwargs: dict[str, Any]
+) -> tuple[Union[str, Path], dict[str, Any], bool]:
+    """Select the source passed to transformers when a local override exists.
+
+    transformers treats `_configuration_file` as a filename inside the model
+    repo/directory. When `model` is a remote repo id, an absolute local file
+    path in `_configuration_file` is incorrectly resolved against the Hub repo.
+    In that case, load directly from the local JSON file instead.
+    """
+
+    override_config_file = kwargs.get("_configuration_file")
+    if (
+        isinstance(override_config_file, str)
+        and override_config_file.strip()
+        and not os.path.isdir(model)
+    ):
+        override_config_file = override_config_file.strip()
+        if os.path.isfile(override_config_file):
+            resolved_kwargs = dict(kwargs)
+            resolved_kwargs.pop("_configuration_file", None)
+            return override_config_file, resolved_kwargs, True
+    return model, kwargs, False
+
+
+def _iter_exception_chain(exc: BaseException):
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        yield current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+
+
+def _exception_chain_message(exc: BaseException) -> str:
+    messages: list[str] = []
+    for current in _iter_exception_chain(exc):
+        message = str(current).strip()
+        if message and message not in messages:
+            messages.append(message)
+    return " | ".join(messages)
+
+
+def _looks_like_network_error(exc: BaseException) -> bool:
+    message = _exception_chain_message(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "temporary failure in name resolution",
+            "name resolution",
+            "failed to resolve",
+            "nodename nor servname",
+            "max retries exceeded",
+            "client has been closed",
+            "connection error",
+            "connection aborted",
+            "connection refused",
+            "connection reset",
+            "network is unreachable",
+            "no route to host",
+            "timed out",
+            "timeout",
+        )
+    )
+
+
+def _load_auto_config_with_cache_fallback(
+    config_source: Union[str, Path],
+    *,
+    model: Union[str, Path],
+    trust_remote_code: bool,
+    revision: Optional[str],
+    config_kwargs: dict[str, Any],
+):
+    try:
+        return AutoConfig.from_pretrained(
+            config_source,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **config_kwargs,
+        )
+    except OSError as exc:
+        if (
+            config_kwargs.get("local_files_only")
+            or os.path.isdir(config_source)
+            or os.path.isfile(config_source)
+            or not _looks_like_network_error(exc)
+        ):
+            raise
+
+        cache_kwargs = dict(config_kwargs)
+        cache_kwargs["local_files_only"] = True
+
+        try:
+            config = AutoConfig.from_pretrained(
+                config_source,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **cache_kwargs,
+            )
+        except OSError as cache_exc:
+            raise OSError(
+                f"Failed to load the configuration of '{model}' due to a network "
+                f"error ({_exception_chain_message(exc)}). Retrying from the local "
+                "Hugging Face cache also failed "
+                f"({_exception_chain_message(cache_exc)}). Fix DNS/proxy/HF_ENDPOINT "
+                "settings or pass a local model path containing config.json."
+            ) from exc
+
+        logger.warning(
+            "Falling back to cached config for %s after network error: %s",
+            model,
+            _exception_chain_message(exc),
+        )
+        return config
+
+
+def _load_dynamic_config_class_with_cache_fallback(
+    class_ref: str,
+    *,
+    model: Union[str, Path],
+    revision: Optional[str],
+    config_kwargs: dict[str, Any],
+):
+    dynamic_kwargs = {
+        key: config_kwargs[key]
+        for key in (
+            "cache_dir",
+            "force_download",
+            "proxies",
+            "token",
+            "local_files_only",
+            "repo_type",
+            "code_revision",
+        )
+        if key in config_kwargs
+    }
+
+    try:
+        return get_class_from_dynamic_module(
+            class_ref,
+            model,
+            revision=revision,
+            **dynamic_kwargs,
+        )
+    except OSError as exc:
+        if dynamic_kwargs.get("local_files_only") or not _looks_like_network_error(exc):
+            raise
+
+        retry_kwargs = dict(dynamic_kwargs)
+        retry_kwargs["local_files_only"] = True
+
+        try:
+            config_class = get_class_from_dynamic_module(
+                class_ref,
+                model,
+                revision=revision,
+                **retry_kwargs,
+            )
+        except OSError as cache_exc:
+            raise OSError(
+                f"Failed to load the config class for '{model}' due to a network "
+                f"error ({_exception_chain_message(exc)}). Retrying from the local "
+                "Hugging Face cache also failed "
+                f"({_exception_chain_message(cache_exc)})."
+            ) from exc
+
+        logger.warning(
+            "Falling back to cached config class for %s after network error: %s",
+            model,
+            _exception_chain_message(exc),
+        )
+        return config_class
+
+
+def _load_auto_config_from_override_file(
+    config_source: Union[str, Path],
+    *,
+    model: Union[str, Path],
+    trust_remote_code: bool,
+    revision: Optional[str],
+    config_kwargs: dict[str, Any],
+):
+    config_dict, unused_kwargs = PretrainedConfig.get_config_dict(
+        config_source,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        **config_kwargs,
+    )
+    has_remote_code = (
+        "auto_map" in config_dict and "AutoConfig" in config_dict["auto_map"]
+    )
+    has_local_code = (
+        "model_type" in config_dict and config_dict["model_type"] in CONFIG_MAPPING
+    )
+
+    if has_remote_code:
+        class_ref = config_dict["auto_map"]["AutoConfig"]
+        upstream_repo = class_ref.split("--")[0] if "--" in class_ref else None
+        trust_remote_code = resolve_trust_remote_code(
+            trust_remote_code,
+            str(model),
+            has_local_code,
+            has_remote_code,
+            upstream_repo=upstream_repo,
+        )
+        if trust_remote_code:
+            config_class = _load_dynamic_config_class_with_cache_fallback(
+                class_ref,
+                model=model,
+                revision=revision,
+                config_kwargs=config_kwargs,
+            )
+            config_class.register_for_auto_class()
+            return config_class.from_dict(config_dict, **unused_kwargs)
+
+    if "model_type" not in config_dict:
+        raise ValueError(
+            f"Unrecognized model in {model}. Should have a `model_type` key in its config.json."
+        )
+
+    if config_dict["model_type"] == "mistral" and "layer_types" in config_dict:
+        logger.info(
+            "Detected mistral model with layer_types, treating as ministral for alternating attention compatibility. "
+        )
+        config_dict["model_type"] = "ministral"
+
+    try:
+        config_class = CONFIG_MAPPING[config_dict["model_type"]]
+    except KeyError:
+        raise ValueError(
+            f"The checkpoint you are trying to load has model type `{config_dict['model_type']}` "
+            "but Transformers does not recognize this architecture. This could be because of an "
+            "issue with the checkpoint, or because your version of Transformers is out of date.\n\n"
+            "You can update Transformers with the command `pip install --upgrade transformers`. If this "
+            "does not work, and the checkpoint is very new, then there may not be a release version "
+            "that supports this model yet. In this case, you can get the most up-to-date code by installing "
+            "Transformers from source with the command "
+            "`pip install git+https://github.com/huggingface/transformers.git`"
+        )
+
+    return config_class.from_dict(config_dict, **unused_kwargs)
 
 
 def download_from_hf(
@@ -496,7 +745,11 @@ def get_config(
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()
 
-    if (
+    config_source, config_kwargs, using_local_override_config = (
+        _resolve_config_pretrained_source(model, kwargs)
+    )
+
+    if not using_local_override_config and (
         "mistral-large-3" in str(model).lower()
         or "mistral-small-4" in str(model).lower()
         or "leanstral" in str(model).lower()
@@ -506,42 +759,58 @@ def get_config(
         )
     else:
         _ensure_llama_flash_attention2_compat()
-        try:
-            config = AutoConfig.from_pretrained(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        if using_local_override_config:
+            config = _load_auto_config_from_override_file(
+                config_source,
+                model=model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                config_kwargs=config_kwargs,
             )
-        except ValueError as e:
-            if not "deepseek_v32" in str(e):
-                raise e
-            config = _load_deepseek_v32_model(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-            )
-        except KeyError as e:
-            # Transformers v5 may register a built-in config class that
-            # conflicts with sglang's custom one (e.g. NemotronHConfig
-            # doesn't handle '-' in hybrid_override_pattern). Fall back
-            # to loading the raw config dict and using sglang's class.
-            # Also handle deepseek_v32 which v5 doesn't recognize.
-            if "deepseek_v32" in str(e):
+        else:
+            try:
+                config = _load_auto_config_with_cache_fallback(
+                    config_source,
+                    model=model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    config_kwargs=config_kwargs,
+                )
+            except ValueError as e:
+                if not "deepseek_v32" in str(e):
+                    raise e
                 config = _load_deepseek_v32_model(
                     model,
                     trust_remote_code=trust_remote_code,
                     revision=revision,
                     **kwargs,
                 )
-            else:
-                config_dict, _ = PretrainedConfig.get_config_dict(
-                    model,
-                    trust_remote_code=trust_remote_code,
-                    revision=revision,
-                    **kwargs,
-                )
-                model_type = config_dict.get("model_type")
-                if model_type in _CONFIG_REGISTRY:
-                    config = _CONFIG_REGISTRY[model_type].from_dict(config_dict)
-                    config._name_or_path = model
+            except KeyError as e:
+                # Transformers v5 may register a built-in config class that
+                # conflicts with sglang's custom one (e.g. NemotronHConfig
+                # doesn't handle '-' in hybrid_override_pattern). Fall back
+                # to loading the raw config dict and using sglang's class.
+                # Also handle deepseek_v32 which v5 doesn't recognize.
+                if "deepseek_v32" in str(e):
+                    config = _load_deepseek_v32_model(
+                        model,
+                        trust_remote_code=trust_remote_code,
+                        revision=revision,
+                        **kwargs,
+                    )
                 else:
-                    raise
+                    config_dict, _ = PretrainedConfig.get_config_dict(
+                        config_source,
+                        trust_remote_code=trust_remote_code,
+                        revision=revision,
+                        **config_kwargs,
+                    )
+                    model_type = config_dict.get("model_type")
+                    if model_type in _CONFIG_REGISTRY:
+                        config = _CONFIG_REGISTRY[model_type].from_dict(config_dict)
+                        config._name_or_path = model
+                    else:
+                        raise
 
     if (
         config.architectures is not None
@@ -588,7 +857,9 @@ def get_config(
         # Temporary hack for load deepseek-ocr2
         config.model_type = "deepseek-ocr"
         config.update({"architectures": ["DeepseekOCRForCausalLM"]})
-        config = DeepseekVLV2Config.from_pretrained(model, revision=revision)
+        config = DeepseekVLV2Config.from_pretrained(
+            config_source, revision=revision, **config_kwargs
+        )
         _override_v_head_dim_if_zero(config)
         config.update({"architectures": ["DeepseekOCRForCausalLM"]})
         setattr(config, "_name_or_path", model)
@@ -598,7 +869,9 @@ def get_config(
             if _is_deepseek_ocr_model(config) or _is_deepseek_ocr2_model(config):
                 model_type = "deepseek-ocr"
         config_class = _CONFIG_REGISTRY[model_type]
-        config = config_class.from_pretrained(model, revision=revision)
+        config = config_class.from_pretrained(
+            config_source, revision=revision, **config_kwargs
+        )
 
         if _is_deepseek_ocr_model(config):
             _override_deepseek_ocr_v_head_dim(config)
@@ -608,6 +881,8 @@ def get_config(
             config.update({"architectures": ["DeepseekOCRForCausalLM"]})
 
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
+        setattr(config, "_name_or_path", model)
+    elif using_local_override_config:
         setattr(config, "_name_or_path", model)
 
     if isinstance(model, str) and config.model_type == "internvl_chat":
@@ -712,49 +987,6 @@ class TokenizerWarningsFilter(logging.Filter):
         return "Calling super().encode with" not in record.getMessage()
 
 
-_is_base_mistral_patched = False
-
-# transformers version where is_base_mistral calls model_info() on every tokenizer load
-_TRANSFORMERS_PATCHED_VERSION = "5.3.0"
-
-
-def _patch_is_base_mistral_in_ci():
-    """Patch transformers' is_base_mistral to avoid HF API calls in CI.
-
-    transformers calls model_info() inside _patch_mistral_regex -> is_base_mistral
-    for every tokenizer load, which hits HF API even with HF_HUB_OFFLINE=1.
-    In CI this exhausts the 3000 req/5min rate limit and causes 429 errors.
-    """
-    global _is_base_mistral_patched
-    if _is_base_mistral_patched:
-        return
-
-    from sglang.srt.environ import envs
-
-    if not envs.SGLANG_IS_IN_CI.get():
-        return
-
-    import transformers
-
-    if transformers.__version__ != _TRANSFORMERS_PATCHED_VERSION:
-        logger.warning(
-            "transformers version changed to %s (expected %s), "
-            "is_base_mistral patch skipped — may need update if 429 errors recur",
-            transformers.__version__,
-            _TRANSFORMERS_PATCHED_VERSION,
-        )
-        _is_base_mistral_patched = True  # don't warn repeatedly
-        return
-
-    import transformers.tokenization_utils_tokenizers as tut
-
-    if hasattr(tut, "is_base_mistral"):
-        tut.is_base_mistral = lambda *a, **kw: False
-        logger.info("CI: patched is_base_mistral to skip HF API calls")
-
-    _is_base_mistral_patched = True
-
-
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -797,8 +1029,6 @@ def get_tokenizer(
         client = create_remote_connector(tokenizer_name)
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         tokenizer_name = client.get_local_dir()
-
-    _patch_is_base_mistral_in_ci()
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
