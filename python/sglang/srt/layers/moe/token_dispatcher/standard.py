@@ -194,7 +194,11 @@ class StandardDispatcher(BaseDispatcher):
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
-            hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
+            global_hidden_states = hidden_states
+            hidden_states = get_local_dp_buffer(
+                dtype=global_hidden_states.dtype,
+                device=global_hidden_states.device,
+            )
             get_tp_group().reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,

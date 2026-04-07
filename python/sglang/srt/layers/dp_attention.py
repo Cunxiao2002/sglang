@@ -123,22 +123,30 @@ class _DpGatheredBufferWrapper:
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
-    def get_global_dp_buffer(cls) -> torch.Tensor:
+    def get_global_dp_buffer(
+        cls,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
         with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._global_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
+                dtype=cls._dtype if dtype is None else dtype,
+                device=cls._device if device is None else device,
             )
         return buffer
 
     @classmethod
-    def get_local_dp_buffer(cls) -> torch.Tensor:
+    def get_local_dp_buffer(
+        cls,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
         with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._local_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
+                dtype=cls._dtype if dtype is None else dtype,
+                device=cls._device if device is None else device,
             )
         return buffer
 
@@ -190,12 +198,18 @@ def set_dp_buffer_len(
     )
 
 
-def get_global_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer()
+def get_global_dp_buffer(
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_global_dp_buffer(dtype=dtype, device=device)
 
 
-def get_local_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer()
+def get_local_dp_buffer(
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(dtype=dtype, device=device)
 
 
 def get_global_dp_buffer_len() -> int:

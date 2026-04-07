@@ -153,9 +153,10 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         # for decode: attn tp full -> full
         if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
-            hidden_states, local_hidden_states = (
-                get_local_dp_buffer(),
-                hidden_states,
+            local_hidden_states = hidden_states
+            hidden_states = get_local_dp_buffer(
+                dtype=local_hidden_states.dtype,
+                device=local_hidden_states.device,
             )
             attn_cp_all_gather_into_tensor(
                 hidden_states,

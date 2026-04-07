@@ -747,9 +747,10 @@ class CommunicateSimpleFn:
                 gathered_hidden_states.append(output)
             return tuple(gathered_hidden_states)
 
-        hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
-            hidden_states,
+        local_hidden_states = hidden_states
+        hidden_states = get_local_dp_buffer(
+            dtype=local_hidden_states.dtype,
+            device=local_hidden_states.device,
         )
         attn_tp_all_gather_into_tensor(
             hidden_states,
@@ -844,9 +845,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
 
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
-            residual, local_residual = (
-                get_local_dp_buffer(),
-                residual,
+            local_residual = residual
+            residual = get_local_dp_buffer(
+                dtype=local_residual.dtype,
+                device=local_residual.device,
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
@@ -861,9 +863,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
             elif context.attn_tp_rank == 0:
                 hidden_states += residual
 
-            hidden_states, local_hidden_states = (
-                get_global_dp_buffer(),
-                hidden_states,
+            local_hidden_states = hidden_states
+            hidden_states = get_global_dp_buffer(
+                dtype=local_hidden_states.dtype,
+                device=local_hidden_states.device,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
 
@@ -1003,9 +1006,10 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
-        hidden_states, global_hidden_states = (
-            get_local_dp_buffer(),
-            hidden_states,
+        global_hidden_states = hidden_states
+        hidden_states = get_local_dp_buffer(
+            dtype=global_hidden_states.dtype,
+            device=global_hidden_states.device,
         )
         if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
             # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
@@ -1024,9 +1028,10 @@ class CommunicateSummableTensorPairFn:
     ):
         hidden_states += residual
         residual = None
-        hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
-            hidden_states,
+        local_hidden_states = hidden_states
+        hidden_states = get_local_dp_buffer(
+            dtype=local_hidden_states.dtype,
+            device=local_hidden_states.device,
         )
         attn_tp_all_gather_into_tensor(
             hidden_states,
