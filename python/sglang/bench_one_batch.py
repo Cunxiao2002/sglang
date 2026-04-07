@@ -450,10 +450,18 @@ def decode(input_token_ids, batch, model_runner):
 
 def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
     if require_mlp_sync(model_runner.server_args):
+        attn_dp_size = (
+            model_runner.server_args.dp_size
+            if model_runner.server_args.enable_dp_attention
+            else 1
+        )
+        attn_cp_size = model_runner.server_args.attn_cp_size
+        attn_tp_size = model_runner.server_args.tp_size // attn_dp_size // attn_cp_size
         prepare_mlp_sync_batch_raw(
             batch,
             dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=1,
+            attn_tp_size=attn_tp_size,
+            attn_cp_size=attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
