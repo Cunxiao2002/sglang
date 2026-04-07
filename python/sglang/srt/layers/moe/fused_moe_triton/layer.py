@@ -24,6 +24,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
@@ -84,6 +85,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
+    deepep_async_finish = not envs.SGLANG_DEEPEP_SYNC_FINISH.get()
     if a2a_backend.is_none():
         return StandardDispatcher(moe_runner_config)
     elif (
@@ -105,7 +107,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
-            async_finish=True,
+            async_finish=deepep_async_finish,
             return_recv_hook=True,
         )
     elif a2a_backend.is_ascend_fuseep():
