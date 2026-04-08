@@ -98,6 +98,31 @@ nsys profile \
       --profile \
       --enable-layerwise-nvtx-marker
 
+# glm5-fp8
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SGLANG_DEEPEP_SYNC_FINISH=1 \
+nsys profile \
+    --trace-fork-before-exec=true \
+    --trace=cuda,nvtx,osrt \
+    --capture-range=cudaProfilerApi \
+    --capture-range-end=stop \
+    -f true \
+    -o sglang_glm5_tp8_b64_s1024_deepgemm_deepep_nvtx \
+    python3 benchmark/bench_single_layer.py \
+      --model-path zai-org/GLM-5-FP8 \
+      --trust-remote-code \
+      --tp 8 \
+      --all2all-backend deepep_high_throughput \
+      --moe-runner-backend deep_gemm \
+      --fp8-gemm-backend deep_gemm \
+      --batch-size 64 \
+      --seq-len 1024 \
+      --output-len 1 \
+      --num-layers 1 \
+      --layer-start 4 \
+      --load-format dummy \
+      --profile \
+      --enable-layerwise-nvtx-marker
+
 
 Important launcher note:
   In this SGLang benchmark, `external_launcher` expects `WORLD_SIZE == dp`.
