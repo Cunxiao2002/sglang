@@ -38,7 +38,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
-from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils import get_layer_id, get_weight_shape, materialize_weight
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,
     should_async_load,
@@ -286,9 +286,9 @@ class DeepseekV2WeightLoaderMixin:
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
 
-                                if q_a_proj_weight.shape == torch.Size(
+                                if get_weight_shape(q_a_proj_weight) == torch.Size(
                                     []
-                                ) and kv_a_proj_weight.shape == torch.Size([]):
+                                ) and get_weight_shape(kv_a_proj_weight) == torch.Size([]):
                                     fused_weight = q_a_proj_weight
                                 else:
                                     cat_dim = 0
@@ -300,7 +300,7 @@ class DeepseekV2WeightLoaderMixin:
                                         cat_dim = 1
 
                                     fused_weight = torch.cat(
-                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                                        [materialize_weight(q_a_proj_weight), materialize_weight(kv_a_proj_weight)], dim=cat_dim
                                     )
 
                                 param_name = (

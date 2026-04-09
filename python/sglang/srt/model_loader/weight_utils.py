@@ -41,6 +41,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
+from sglang.srt.layers.utils import materialize_weight, narrow_weight_tensor
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -835,11 +836,11 @@ def buffered_multi_thread_safetensors_weights_iterator(
     def _load_file(st_file: str):
         if disable_mmap:
             with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
+                return safetensors.torch.load(f.read())
         else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
-        return result
+            # Open without closing; the main loop keeps the file alive while
+            # yielding PySafeSlice objects and closes it when done.
+            return safetensors.safe_open(st_file, framework="pt", device="cpu")
 
     # Sliding window: max_workers loading + 1 prefetched.
     buffer_size = max_workers + 1
@@ -861,7 +862,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
         ) as pbar:
             while pending:
                 future = pending.popleft()
-                state_dict = future.result()
+                file_obj = future.result()
                 del future  # let GC reclaim the Future's internal result
 
                 # Replenish: submit the next file to keep the buffer full.
@@ -869,9 +870,21 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 if next_file is not None:
                     pending.append(executor.submit(_load_file, next_file))
 
-                for name in sorted(state_dict.keys()):
-                    yield name, state_dict[name]
-                del state_dict
+                if isinstance(file_obj, dict):
+                    # disable_mmap: dict of pre-loaded tensors
+                    for name in sorted(file_obj.keys()):
+                        yield name, file_obj[name]
+                    del file_obj
+                else:
+                    # mmap: SafeOpen object - yield PySafeSlice objects so that
+                    # weight loaders can read only the needed shard from disk.
+                    # The file stays open until all slices for this shard are
+                    # consumed, then is closed in the finally block.
+                    try:
+                        for name in sorted(file_obj.keys()):
+                            yield name, file_obj.get_slice(name)
+                    finally:
+                        file_obj.__exit__(None, None, None)
                 pbar.update(1)
 
 
@@ -1008,6 +1021,7 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:
+        loaded_weight = materialize_weight(loaded_weight)
         if param.numel() == 1 and loaded_weight.numel() == 1:
             # Sometimes scalar values aren't considered tensors with shapes
             # so if both param and loaded_weight are a scalar,
@@ -1036,7 +1050,7 @@ def row_parallel_weight_loader(
     if shard_dim is not None:
         shard_size = param.data.shape[shard_dim]
         start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
+        loaded_weight = narrow_weight_tensor(loaded_weight, shard_dim, start_idx, shard_size)
 
     return default_weight_loader(param, loaded_weight)
 
@@ -1069,7 +1083,7 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
             )
             return default_weight_loader(param_data, loaded_weight)
         else:
-            loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
+            loaded_weight = narrow_weight_tensor(loaded_weight, shard_axis, start_idx, shard_size)
             return default_weight_loader(param, loaded_weight)
 
     return loader

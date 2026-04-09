@@ -15,6 +15,51 @@ def get_layer_id(weight_name):
     return None
 
 
+def narrow_weight_tensor(
+    loaded_weight: torch.Tensor, dim: int, start: int, size: int
+) -> torch.Tensor:
+    """Narrow a loaded weight along ``dim``.
+
+    Handles both :class:`torch.Tensor` (via ``.narrow``) and the
+    ``PySafeSlice`` objects returned by ``safetensors.safe_open.get_slice``.
+    Indexing a ``PySafeSlice`` triggers I/O for exactly the requested byte
+    range, so only the TP-rank's shard is ever read from disk.
+    """
+    if isinstance(loaded_weight, torch.Tensor):
+        return loaded_weight.narrow(dim, start, size)
+    ndim = len(loaded_weight.get_shape())
+    idx = tuple(
+        slice(start, start + size) if i == dim else slice(None)
+        for i in range(ndim)
+    )
+    return loaded_weight[idx]
+
+
+def get_weight_shape(loaded_weight: torch.Tensor):
+    """Return the shape of a weight without materializing it.
+
+    Works for both :class:`torch.Tensor` and ``PySafeSlice`` objects returned
+    by ``safetensors.safe_open.get_slice``.  Use this instead of
+    ``loaded_weight.shape`` whenever the weight may still be a lazy slice.
+    """
+    if isinstance(loaded_weight, torch.Tensor):
+        return loaded_weight.shape
+    return loaded_weight.get_shape()
+
+
+def materialize_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """Materialize a ``PySafeSlice`` into a :class:`torch.Tensor`.
+
+    If *loaded_weight* is already a tensor this is a no-op.  Call this
+    whenever downstream code needs to access ``.shape``, ``.dtype``,
+    ``.narrow``, etc. and the partial-read optimisation in
+    ``narrow_weight_tensor`` is not applicable.
+    """
+    if not isinstance(loaded_weight, torch.Tensor):
+        return loaded_weight[:]
+    return loaded_weight
+
+
 def pad_or_narrow_weight(
     loaded_weight: torch.Tensor, input_dim: int, start_idx: int, shard_size: int
 ) -> torch.Tensor:

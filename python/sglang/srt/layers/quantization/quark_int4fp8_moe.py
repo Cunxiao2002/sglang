@@ -12,6 +12,7 @@ from sglang.srt.layers.int4fp8_utils import (
     quantize_int4_scale_columnwise,
 )
 from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.utils import materialize_weight, narrow_weight_tensor
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -171,14 +172,15 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
 
                 if shard_id in ["w1", "w3"]:
                     shard_dim = 0
-                    loaded_weight = loaded_weight.narrow(
-                        shard_dim, shard_size * self.tp_rank, shard_size
-                    )
                 else:
                     shard_dim = 1
-                    loaded_weight = loaded_weight.narrow(
-                        shard_dim, shard_size * self.tp_rank, shard_size
-                    )
+                loaded_weight = narrow_weight_tensor(
+                    loaded_weight, shard_dim, shard_size * self.tp_rank, shard_size
+                )
+
+            # narrow_weight_tensor returns a tensor; materialize any remaining PySafeSlice
+            # (presharded path where narrowing was skipped).
+            loaded_weight = materialize_weight(loaded_weight)
 
             # We want to run online quantization on-device for speed purposes.
             loaded_weight = loaded_weight.to(param.device)

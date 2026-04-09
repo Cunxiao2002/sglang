@@ -55,6 +55,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.utils import narrow_weight_tensor
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -99,7 +100,7 @@ class LayerNorm(nn.Module):
         if shard_dim is not None:
             shard_size = param_data.shape[shard_dim]
             start_idx = tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
+            loaded_weight = narrow_weight_tensor(loaded_weight, shard_dim, start_idx, shard_size)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 

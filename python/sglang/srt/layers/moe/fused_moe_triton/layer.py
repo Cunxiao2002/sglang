@@ -60,6 +60,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.layers.utils import materialize_weight, narrow_weight_tensor
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -322,6 +323,7 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         expert_id: int,
     ):
+        loaded_weight = materialize_weight(loaded_weight)
         param_data = param.data
         # for per tensor weight quantization
         if shard_id in ("w1", "w3"):
@@ -376,7 +378,7 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
-            expert_data.copy_(loaded_weight)
+            expert_data.copy_(materialize_weight(loaded_weight))
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -432,6 +434,7 @@ class FusedMoE(torch.nn.Module):
         # This handles the case where the loaded weights are smaller than the padded expert_data
         use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
         if use_padded_loading:
+            loaded_weight = materialize_weight(loaded_weight)
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -446,9 +449,11 @@ class FusedMoE(torch.nn.Module):
                 if not is_bias and self.use_triton_kernels:
                     # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
+                loaded_weight = narrow_weight_tensor(
+                    loaded_weight, shard_dim, shard_size * tp_rank, shard_size
                 )
+            else:
+                loaded_weight = materialize_weight(loaded_weight)
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
         expert_data.copy_(loaded_weight)
@@ -471,10 +476,10 @@ class FusedMoE(torch.nn.Module):
             loaded_weight: The weight tensor to load from
             tp_rank: The tensor parallel rank
         """
-        if not isinstance(expert_data, torch.Tensor) or not isinstance(
-            loaded_weight, torch.Tensor
-        ):
-            raise ValueError("expert_data and loaded_weight must be torch.Tensor")
+        # if not isinstance(expert_data, torch.Tensor) or not isinstance(
+        #     loaded_weight, torch.Tensor
+        # ):
+        #     raise ValueError("expert_data and loaded_weight must be torch.Tensor")
 
         if (
             self.quant_config is not None
@@ -506,6 +511,7 @@ class FusedMoE(torch.nn.Module):
         # This handles the case where the loaded weights are smaller than the padded expert_data
         use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
         if use_padded_loading:
+            loaded_weight = materialize_weight(loaded_weight)
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -519,9 +525,11 @@ class FusedMoE(torch.nn.Module):
             if not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
+                loaded_weight = narrow_weight_tensor(
+                    loaded_weight, shard_dim, shard_size * tp_rank, shard_size
                 )
+            else:
+                loaded_weight = materialize_weight(loaded_weight)
 
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
@@ -529,6 +537,7 @@ class FusedMoE(torch.nn.Module):
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
     ):
+        loaded_weight = materialize_weight(loaded_weight)
         param_data = param.data
 
         # Input scales can be loaded directly and should be equal.
@@ -552,7 +561,7 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             assert shard_id in ("w1", "w3")
-            expert_data.copy_(loaded_weight)
+            expert_data.copy_(materialize_weight(loaded_weight))
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         num_global_routed_experts = self.num_experts - self.num_fused_shared_experts
@@ -586,6 +595,7 @@ class FusedMoE(torch.nn.Module):
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
         ):
+            loaded_weight = materialize_weight(loaded_weight)
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
@@ -692,18 +702,12 @@ class FusedMoE(torch.nn.Module):
                 weight_name=weight_name,
             )
 
-        loaded_weight = (
-            loaded_weight.t().contiguous()
-            if (
-                method.__class__.__name__
-                in [
-                    "CompressedTensorsWNA16MarlinMoE",
-                    "CompressedTensorsWNA16MoE",
-                    "CompressedTensorsWNA16TritonMoE",
-                ]
-            )
-            else loaded_weight
-        )
+        if method.__class__.__name__ in [
+            "CompressedTensorsWNA16MarlinMoE",
+            "CompressedTensorsWNA16MoE",
+            "CompressedTensorsWNA16TritonMoE",
+        ]:
+            loaded_weight = materialize_weight(loaded_weight).t().contiguous()
 
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
@@ -737,6 +741,7 @@ class FusedMoE(torch.nn.Module):
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
+            loaded_weight = materialize_weight(loaded_weight)
             # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust input_scale for e4m3fnuz (AMD)
             if _is_hip and get_bool_env_var("SGLANG_INT4_WEIGHT"):
                 loaded_weight = loaded_weight * 2.0
@@ -813,7 +818,7 @@ class FusedMoE(torch.nn.Module):
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust INT4 column-wise scaling number to e4m3fnuz (AMD)
                 if _is_hip and get_bool_env_var("SGLANG_INT4_WEIGHT"):
-                    loaded_weight = loaded_weight * 0.5
+                    loaded_weight = materialize_weight(loaded_weight) * 0.5
 
                 self._load_per_channel_weight_scale(
                     shard_id=shard_id,
@@ -836,7 +841,7 @@ class FusedMoE(torch.nn.Module):
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
                 if _is_hip and get_bool_env_var("SGLANG_INT4_WEIGHT"):
-                    loaded_weight = loaded_weight * 2.0
+                    loaded_weight = materialize_weight(loaded_weight) * 2.0
 
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
@@ -895,6 +900,7 @@ class FusedMoE(torch.nn.Module):
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
         ):
+            loaded_weight = materialize_weight(loaded_weight)
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
@@ -912,17 +918,11 @@ class FusedMoE(torch.nn.Module):
         method = self.quant_method
         if hasattr(self, "scheme"):
             method = self.scheme
-        loaded_weight = (
-            loaded_weight.t().contiguous()
-            if (
-                method.__class__.__name__
-                in [
-                    "CompressedTensorsWNA16MoE",
-                    "CompressedTensorsWNA16TritonMoE",
-                ]
-            )
-            else loaded_weight
-        )
+        if method.__class__.__name__ in [
+            "CompressedTensorsWNA16MoE",
+            "CompressedTensorsWNA16TritonMoE",
+        ]:
+            loaded_weight = materialize_weight(loaded_weight).t().contiguous()
 
         if shard_id not in ("w13", "w2"):
             raise ValueError(f"shard_id must be ['w13','w2'] but got {shard_id}.")

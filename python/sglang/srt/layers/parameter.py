@@ -8,7 +8,7 @@ import torch
 from torch.nn import Parameter
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.layers.utils import get_weight_shape, materialize_weight, narrow_weight_tensor, pad_or_narrow_weight
 from sglang.srt.utils import is_cpu
 
 __all__ = [
@@ -151,6 +151,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             )
 
             if _is_cpu:
+                loaded_weight = materialize_weight(loaded_weight)
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     self.data,
                     loaded_weight,
@@ -163,11 +164,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 param_data.copy_(loaded_weight)
                 return
             else:
-                loaded_weight = loaded_weight.narrow(
-                    self.output_dim, tp_rank * shard_size, shard_size
-                )
+                loaded_weight = narrow_weight_tensor(loaded_weight, self.output_dim, tp_rank * shard_size, shard_size)
 
-        copy_with_check(self.data, loaded_weight)
+        copy_with_check(self.data, materialize_weight(loaded_weight))
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
 
@@ -192,6 +191,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         )
 
         if _is_cpu:
+            loaded_weight = materialize_weight(loaded_weight)
             param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 param_data,
                 loaded_weight,
@@ -206,14 +206,14 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
                 start_idx = tp_rank * shard_size
                 end_idx = start_idx + shard_size
-                if end_idx > loaded_weight.shape[self.output_dim]:
+                if end_idx > get_weight_shape(loaded_weight)[self.output_dim]:
                     loaded_weight = pad_or_narrow_weight(
-                        loaded_weight, self.output_dim, start_idx, shard_size
+                        materialize_weight(loaded_weight), self.output_dim, start_idx, shard_size
                     )
                 else:
-                    loaded_weight = loaded_weight.narrow(
-                        self.output_dim, start_idx, shard_size
-                    )
+                    loaded_weight = narrow_weight_tensor(loaded_weight, self.output_dim, start_idx, shard_size)
+            else:
+                loaded_weight = materialize_weight(loaded_weight)
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
@@ -248,6 +248,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 narrow_padded_param_and_loaded_weight,
             )
 
+            loaded_weight = materialize_weight(loaded_weight)
             param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 param_data,
                 loaded_weight,
@@ -259,9 +260,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             )
         else:
             if not use_presharded_weights:
-                loaded_weight = loaded_weight.narrow(
-                    self.output_dim, shard_id * shard_size, shard_size
-                )
+                loaded_weight = narrow_weight_tensor(loaded_weight, self.output_dim, shard_id * shard_size, shard_size)
+            else:
+                loaded_weight = materialize_weight(loaded_weight)
 
         assert (
             param_data.shape == loaded_weight.shape
@@ -299,6 +300,7 @@ class RowvLLMParameter(BasevLLMParameter):
             )
 
             if _is_cpu:
+                loaded_weight = materialize_weight(loaded_weight)
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     self.data,
                     loaded_weight,
@@ -316,14 +318,12 @@ class RowvLLMParameter(BasevLLMParameter):
                 # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
                 start_idx = tp_rank * shard_size
                 end_idx = start_idx + shard_size
-                if end_idx > loaded_weight.shape[self.input_dim]:
+                if end_idx > get_weight_shape(loaded_weight)[self.input_dim]:
                     loaded_weight = pad_or_narrow_weight(
-                        loaded_weight, self.input_dim, start_idx, shard_size
+                        materialize_weight(loaded_weight), self.input_dim, start_idx, shard_size
                     )
                 else:
-                    loaded_weight = loaded_weight.narrow(
-                        self.input_dim, start_idx, shard_size
-                    )
+                    loaded_weight = narrow_weight_tensor(loaded_weight, self.input_dim, start_idx, shard_size)
 
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
@@ -427,6 +427,7 @@ class PerTensorScaleParameter(BasevLLMParameter):
 
         # AutoFP8 scales do not have a shape
         # compressed-tensors scales do have a shape
+        loaded_weight = materialize_weight(loaded_weight)
         if len(loaded_weight.shape) != 0:
             assert loaded_weight.shape[0] == 1
             loaded_weight = loaded_weight[0]

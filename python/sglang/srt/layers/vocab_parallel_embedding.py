@@ -26,6 +26,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.layers.parameter import BasevLLMParameter
+from sglang.srt.layers.utils import get_weight_shape, materialize_weight, narrow_weight_tensor
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -423,18 +424,21 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # If the parameter is a gguf weight, then load it directly.
         if getattr(param, "is_gguf_weight_type", None):
+            loaded_weight = materialize_weight(loaded_weight)
             param.data.copy_(loaded_weight)
             param.weight_type = loaded_weight.item()
             return
         elif isinstance(param, UninitializedParameter):
-            shape = list(loaded_weight.shape)
+            shape = list(get_weight_shape(loaded_weight))
             if output_dim is not None:
                 shape[output_dim] = shape[output_dim] // self.tp_size
+            loaded_weight = materialize_weight(loaded_weight)
             param.materialize(tuple(shape), dtype=loaded_weight.dtype)
 
         # If parameter does not have output dim, then it should
         # be copied onto all gpus (e.g. g_idx for act_order gptq).
         if output_dim is None:
+            loaded_weight = materialize_weight(loaded_weight)
             assert param.data.shape == loaded_weight.shape
             param.data.copy_(loaded_weight)
             return
@@ -451,20 +455,22 @@ class VocabParallelEmbedding(torch.nn.Module):
                 if isinstance(param, BasevLLMParameter)
                 else param.packed_factor
             )
-            assert loaded_weight.shape[output_dim] == (
+            assert get_weight_shape(loaded_weight)[output_dim] == (
                 self.org_vocab_size // param.packed_factor
             )
             start_idx = start_idx // packed_factor
             shard_size = shard_size // packed_factor
         else:
-            assert loaded_weight.shape[output_dim] == (
+            assert get_weight_shape(loaded_weight)[output_dim] == (
                 self.org_vocab_size
                 // (self.tp_size if self.use_presharded_weights else 1)
-            ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+            ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {get_weight_shape(loaded_weight)[output_dim]=}"
 
         # Copy the data.
         if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            loaded_weight = narrow_weight_tensor(loaded_weight, output_dim, start_idx, shard_size)
+        else:
+            loaded_weight = materialize_weight(loaded_weight)
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 

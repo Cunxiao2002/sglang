@@ -46,6 +46,7 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.utils import narrow_weight_tensor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
@@ -677,7 +678,7 @@ class Gemma4AudioConformerLightConv1d(nn.Module):
 
         def _shard_dim0(param, loaded_weight, _rank=tp_rank, _tp=tp_size):
             shard = param.shape[0]
-            loaded_weight = loaded_weight.narrow(0, _rank * shard, shard)
+            loaded_weight = narrow_weight_tensor(loaded_weight, 0, _rank * shard, shard)
             param.data.copy_(loaded_weight)
 
         set_weight_attrs(self.depthwise_conv1d.weight, {"weight_loader": _shard_dim0})

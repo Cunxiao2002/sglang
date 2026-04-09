@@ -29,7 +29,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.layers.utils import MultiPlatformOp, narrow_weight_tensor
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -327,7 +327,7 @@ class ScaledActivation(nn.Module):
             tp_rank = get_tensor_model_parallel_rank()
             shard_size = param_data.shape[0]
             start_idx = tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
+            loaded_weight = narrow_weight_tensor(loaded_weight, 0, start_idx, shard_size)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
