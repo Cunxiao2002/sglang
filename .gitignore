@@ -232,6 +232,10 @@ work_dirs/
 # Autoenv
 .env.leave
 
+# Local remote-execution wrapper state
+remote-run/config.ini
+remote-run/artifacts/
+
 # Rust lib
 Cargo.lock
 
