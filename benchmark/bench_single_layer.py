@@ -152,6 +152,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
+from types import MethodType
 from typing import Any, Iterable, Optional, Sequence
 
 import torch
@@ -1403,11 +1404,181 @@ def tp_all_reduce_max(value: float) -> float:
     return float(tensor.item())
 
 
+def _build_uniform_rank_router_logits(
+    hidden_states: torch.Tensor,
+    *,
+    num_experts: int,
+    routed_top_k: int,
+    ep_size: int,
+    experts_per_rank: int,
+) -> torch.Tensor:
+    num_tokens = hidden_states.shape[0]
+    logits = torch.full(
+        (num_tokens, num_experts),
+        -1e4,
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    if num_tokens == 0:
+        return logits
+
+    token_idx = torch.arange(num_tokens, device=hidden_states.device, dtype=torch.int64)
+    start_rank = token_idx.remainder(ep_size)
+    local_base = (token_idx // ep_size).remainder(experts_per_rank)
+
+    for slot in range(routed_top_k):
+        rank = (start_rank + slot).remainder(ep_size)
+        local_offset = (local_base + slot // ep_size).remainder(experts_per_rank)
+        expert_id = rank * experts_per_rank + local_offset
+        logits[token_idx, expert_id] = float(routed_top_k - slot)
+
+    return logits
+
+
+def maybe_patch_uniform_rank_moe_router(model_runner: ModelRunner, router_mode: str) -> int:
+    if router_mode != "uniform_rank":
+        return 0
+
+    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+    from sglang.srt.models.glm4_moe import Glm4MoeSparseMoeBlock
+    from sglang.srt.models.llama4 import Llama4MoE
+    from sglang.srt.models.minimax_m2 import MiniMaxM2MoE
+    from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
+    supported_moe_classes = (
+        DeepseekV2MoE,
+        Glm4MoeSparseMoeBlock,
+        Qwen2MoeSparseMoeBlock,
+        MiniMaxM2MoE,
+        Llama4MoE,
+    )
+
+    def uniform_rank_forward_tensor(
+        self,
+        hidden_states,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        del args, kwargs
+        return _build_uniform_rank_router_logits(
+            hidden_states,
+            num_experts=self._bench_uniform_num_experts,
+            routed_top_k=self._bench_uniform_routed_top_k,
+            ep_size=self._bench_uniform_ep_size,
+            experts_per_rank=self._bench_uniform_experts_per_rank,
+        )
+
+    def uniform_rank_forward_tuple(
+        self,
+        hidden_states,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        del args, kwargs
+        logits = _build_uniform_rank_router_logits(
+            hidden_states,
+            num_experts=self._bench_uniform_num_experts,
+            routed_top_k=self._bench_uniform_routed_top_k,
+            ep_size=self._bench_uniform_ep_size,
+            experts_per_rank=self._bench_uniform_experts_per_rank,
+        )
+        return logits, None
+
+    patched = 0
+    with torch.no_grad():
+        for module in model_runner.model.modules():
+            if not isinstance(module, supported_moe_classes):
+                continue
+
+            if isinstance(module, Llama4MoE):
+                route_module = module.router
+                returns_tuple = True
+                correction_bias = None
+            else:
+                route_module = module.gate
+                returns_tuple = isinstance(
+                    module, (Qwen2MoeSparseMoeBlock, MiniMaxM2MoE)
+                )
+                correction_bias = getattr(
+                    module.gate, "e_score_correction_bias", None
+                )
+                if correction_bias is None:
+                    correction_bias = getattr(module, "e_score_correction_bias", None)
+
+            if getattr(route_module, "_bench_uniform_rank_router", False):
+                continue
+
+            if not hasattr(route_module, "weight"):
+                raise ValueError(
+                    f"uniform_rank router patch expects a weight-bearing routing module, got {type(route_module).__name__}."
+                )
+
+            num_experts = int(route_module.weight.shape[0])
+            num_fused_shared_experts = int(
+                getattr(module.topk.topk_config, "num_fused_shared_experts", 0)
+            )
+            routed_top_k = int(module.topk.topk_config.top_k) - num_fused_shared_experts
+            ep_size = max(
+                int(
+                    getattr(
+                        module.experts,
+                        "moe_ep_size",
+                        getattr(module, "moe_ep_size", getattr(module, "ep_size", 1)),
+                    )
+                ),
+                1,
+            )
+            if num_experts % ep_size != 0:
+                raise ValueError(
+                    "uniform_rank router requires routed experts to divide evenly "
+                    f"across EP ranks, got num_experts={num_experts}, ep_size={ep_size}."
+                )
+            if routed_top_k <= 0:
+                raise ValueError(
+                    f"uniform_rank router requires positive routed_top_k, got {routed_top_k}."
+                )
+
+            route_module._bench_uniform_num_experts = num_experts
+            route_module._bench_uniform_routed_top_k = routed_top_k
+            route_module._bench_uniform_ep_size = ep_size
+            route_module._bench_uniform_experts_per_rank = num_experts // ep_size
+            route_module.forward = MethodType(
+                uniform_rank_forward_tuple if returns_tuple else uniform_rank_forward_tensor,
+                route_module,
+            )
+            route_module._bench_uniform_rank_router = True
+
+            if correction_bias is not None:
+                correction_bias.zero_()
+
+            if (
+                module.topk.topk_config.use_grouped_topk
+                and module.topk.topk_config.num_expert_group is not None
+            ):
+                # Keep the grouped-topk path for DeepSeek shared-expert handling,
+                # but remove group pruning so round-robin logits are preserved.
+                module.topk.topk_config.topk_group = (
+                    module.topk.topk_config.num_expert_group
+                )
+
+            patched += 1
+
+    if patched == 0:
+        raise ValueError(
+            "uniform_rank router mode only supports the requested MoE families "
+            "(GLM-5, Llama-4 Maverick, Qwen3.5-397B-A17B, DeepSeek-V3.2-Exp, MiniMax-M2.5) "
+            "in the current benchmark patch, but no supported MoE layers were found."
+        )
+
+    return patched
+
+
 def load_direct_model_runner(
     server_args: ServerArgs,
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    moe_router_mode: str,
 ) -> DirectBenchRunner:
     attn_cp_rank, moe_dp_rank, moe_ep_rank = get_parallelism_ranks_for_tp_rank(
         server_args, tp_rank
@@ -1428,6 +1599,14 @@ def load_direct_model_runner(
         attn_cp_rank=attn_cp_rank,
         moe_dp_rank=moe_dp_rank,
     )
+    patched_moe_layers = maybe_patch_uniform_rank_moe_router(
+        model_runner, moe_router_mode
+    )
+    if tp_rank == 0 and patched_moe_layers > 0:
+        print(
+            f"Patched {patched_moe_layers} DeepSeek MoE layer(s) with router_mode={moe_router_mode}.",
+            flush=True,
+        )
     if server_args.tp_size > 1:
         dist.barrier()
     return DirectBenchRunner(model_runner)
@@ -1456,6 +1635,7 @@ def direct_bench_worker(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    moe_router_mode: str,
     local_input_ids: Sequence[Sequence[int]],
     output_len: int,
     num_warmup_iters: int,
@@ -1471,7 +1651,9 @@ def direct_bench_worker(
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
-    model_runner = load_direct_model_runner(server_args, port_args, gpu_id, tp_rank)
+    model_runner = load_direct_model_runner(
+        server_args, port_args, gpu_id, tp_rank, moe_router_mode
+    )
 
     for _ in range(num_warmup_iters):
         run_direct_iteration(model_runner, local_input_ids, output_len)
@@ -1652,6 +1834,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mem-fraction-static", type=float, default=None)
     parser.add_argument("--base-port", type=int, default=30000)
     parser.add_argument("--log-level", type=str, default="error")
+    parser.add_argument(
+        "--moe-router-mode",
+        type=str,
+        default="random",
+        choices=["random", "uniform_rank"],
+        help=(
+            "Routing behavior for MoE benchmark. "
+            "'random' keeps the existing dummy-initialized router; "
+            "'uniform_rank' replaces DeepSeek MoE router logits with a "
+            "deterministic round-robin pattern so tokens are balanced across EP ranks."
+        ),
+    )
     return parser
 
 
@@ -1684,6 +1878,7 @@ def print_config_summary(
         f"fp8_gemm_backend={server_args.fp8_gemm_runner_backend}, "
         f"executor_backend={args.distributed_executor_backend}, "
         f"load_format={args.load_format}, "
+        f"moe_router_mode={args.moe_router_mode}, "
         f"requested_block_size={args.block_size}, "
         f"resolved_page_size={server_args.page_size}, "
         f"nccl_port={server_args.nccl_port}, "
@@ -1734,6 +1929,7 @@ def run_direct_benchmark(
                     port_args,
                     gpu_id,
                     tp_rank,
+                    args.moe_router_mode,
                     worker_input_ids,
                     args.output_len,
                     args.num_warmup_iters,
