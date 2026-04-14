@@ -56,11 +56,15 @@ nsys profile \
     --capture-range=cudaProfilerApi \
     --capture-range-end=stop \
     -f true \
-    -o sglang_dpsk_tp8_b64_s1024_deepgemm_deepep_nvtx \
+    -o sglang_dpsk_tp8_dp8_ep8_dpa_b64_s1024_deepgemm_deepep_uniform \
     python3 benchmark/bench_single_layer.py \
       --model-path deepseek-ai/DeepSeek-V3.2-Exp \
       --trust-remote-code \
       --tp 8 \
+      --dp 8 \
+      --ep 8 \
+      --enable-dp-attention \
+      --enable-dp-lm-head \
       --all2all-backend deepep_high_throughput \
       --moe-runner-backend deep_gemm \
       --fp8-gemm-backend deep_gemm \
@@ -71,9 +75,10 @@ nsys profile \
       --layer-start 4 \
       --load-format dummy \
       --profile \
-      --enable-layerwise-nvtx-marker
+      --enable-layerwise-nvtx-marker \
+      --moe-router-mode uniform_rank
 
-# MiniMax-M2.5
+# MiniMax-M2.5 TP8
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SGLANG_DEEPEP_SYNC_FINISH=1 \
 nsys profile \
     --trace-fork-before-exec=true \
@@ -100,30 +105,61 @@ nsys profile \
         --enable-layerwise-nvtx-marker \
         --moe-router-mode uniform_rank
 
-# glm5-fp8
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SGLANG_DEEPEP_SYNC_FINISH=1 \
-nsys profile \
-    --trace-fork-before-exec=true \
-    --trace=cuda,nvtx,osrt \
-    --capture-range=cudaProfilerApi \
-    --capture-range-end=stop \
-    -f true \
-    -o sglang_glm5_tp8_b64_s1024_deepgemm_deepep_nvtx \
-    python3 benchmark/bench_single_layer.py \
-      --model-path zai-org/GLM-5-FP8 \
+# Minimax-M2.5 DP8
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+    nsys profile \
+      --trace-fork-before-exec=true \
+      --trace=cuda,nvtx,osrt \
+      --capture-range=cudaProfilerApi \
+      --capture-range-end=stop \
+      -f true \
+      -o sglang_minimax_dp8_external_launch_b64_s1024_uniform \
+    torchrun --standalone --nproc-per-node=8 benchmark/bench_single_layer.py \
+      --model-path MiniMaxAI/MiniMax-M2.5 \
       --trust-remote-code \
-      --tp 8 \
-      --all2all-backend deepep_high_throughput \
-      --moe-runner-backend deep_gemm \
-      --fp8-gemm-backend deep_gemm \
+      --distributed-executor-backend external_launcher \
+      --dp 8 \
+      --tp 1 \
+      --ep 1 \
+      --all2all-backend naive\
+      --dtype bfloat16 \
       --batch-size 64 \
       --seq-len 1024 \
       --output-len 1 \
       --num-layers 1 \
       --layer-start 4 \
       --load-format dummy \
+      --profile --disable-piecewise-cuda-graph \
+      --enable-layerwise-nvtx-marker --moe-router-mode uniform_rank
+
+# glm5-fp8
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  nsys profile \
+    --trace-fork-before-exec=true \
+    --trace=cuda,nvtx,osrt \
+    --capture-range=cudaProfilerApi \
+    --capture-range-end=stop \
+    -f true \
+    -o sglang_glm5_tp8_dp8_dpa_ep8_b128_s1024_deepep_deepgemm_uniform \
+    python3 benchmark/bench_single_layer.py \
+      --model-path zai-org/GLM-5-FP8 \
+      --trust-remote-code \
+      --tp 8 \
+      --dp 8 \
+      --ep 8 \
+      --enable-dp-attention \
+      --enable-dp-lm-head \
+      --all2all-backend deepep_high_throughput \
+      --moe-runner-backend deep_gemm \
+      --batch-size 128 \
+      --seq-len 1024 \
+      --output-len 1 \
+      --num-layers 1 \
+      --layer-start 4 \
+      --load-format dummy \
       --profile \
-      --enable-layerwise-nvtx-marker
+      --enable-layerwise-nvtx-marker \
+      --moe-router-mode uniform_rank
 
 
 Important launcher note:
@@ -1293,6 +1329,7 @@ def create_server_args(
         max_mamba_cache_size=None,
         disable_radix_cache=True,
         disable_overlap_schedule=True,
+        disable_piecewise_cuda_graph=args.disable_piecewise_cuda_graph,
         skip_tokenizer_init=True,
         log_level=args.log_level,
         port=args.base_port + local_launcher_rank * PORT_STRIDE,
@@ -1830,6 +1867,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-cuda-graph",
         action="store_true",
         help="Explicitly enable SGLang CUDA graph for decode. When omitted, keep SGLang's default behavior.",
+    )
+    parser.add_argument(
+        "--disable-piecewise-cuda-graph",
+        action="store_true",
+        help="Disable piecewise CUDA graph for extend/prefill.",
     )
     parser.add_argument("--dtype", type=str, default="auto")
     parser.add_argument("--device", type=str, default=None)
